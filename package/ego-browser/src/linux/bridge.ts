@@ -43,18 +43,30 @@ export async function connectLinuxBridge(
   const port = options.port ?? 9222;
   const timeoutMs = options.timeoutMs ?? 5000;
 
-  const targets = await fetchJson<Array<{ webSocketDebuggerUrl: string }>>(
-    `http://127.0.0.1:${port}/json`,
-  );
-
-  const page = targets.find((t) => t.webSocketDebuggerUrl);
-  if (!page) {
+  // Connect to the BROWSER endpoint, not a page's WS: browser-level Target
+  // methods (createBrowserContext, createTarget for task-space isolation)
+  // are rejected on page-level connections. Flattened sessions multiplex all
+  // page traffic over this one socket via sessionId.
+  let wsUrl: string | undefined;
+  try {
+    const version = await fetchJson<{ webSocketDebuggerUrl?: string }>(
+      `http://127.0.0.1:${port}/json/version`,
+    );
+    wsUrl = version.webSocketDebuggerUrl;
+  } catch {}
+  if (!wsUrl) {
+    const targets = await fetchJson<Array<{ webSocketDebuggerUrl: string }>>(
+      `http://127.0.0.1:${port}/json`,
+    );
+    wsUrl = targets.find((t) => t.webSocketDebuggerUrl)?.webSocketDebuggerUrl;
+  }
+  if (!wsUrl) {
     throw new Error(
-      `No page target found on port ${port}. Is Chrome running with --remote-debugging-port=${port}?`,
+      `No debuggable target found on port ${port}. Is Chrome running with --remote-debugging-port=${port}?`,
     );
   }
 
-  const ws = await connectWithTimeout(page.webSocketDebuggerUrl, timeoutMs);
+  const ws = await connectWithTimeout(wsUrl, timeoutMs);
 
   ws.on("message", (data) => {
     options.onMessage?.(data.toString());

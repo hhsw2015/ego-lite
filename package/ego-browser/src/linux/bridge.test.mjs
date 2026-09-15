@@ -70,7 +70,7 @@ describe("linux bridge", () => {
 
     await assert.rejects(
       () => connectLinuxBridge({ port: PORT, timeoutMs: 500 }),
-      /No page target found/,
+      /No debuggable target found/,
     );
   });
 

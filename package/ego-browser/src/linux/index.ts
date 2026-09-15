@@ -23,7 +23,7 @@ import { join } from "node:path";
 import { connectLinuxBridge } from "./bridge.js";
 import { launchChrome, type ChromeInstance } from "./launcher.js";
 import { LinuxSnapshot } from "./snapshot-ax.js";
-import { LinuxTaskSpaces } from "./task-spaces.js";
+import { activeBrowserContextId, LinuxTaskSpaces } from "./task-spaces.js";
 
 const WS_PORT = Number(process.env.EGO_LINUX_PORT ?? 9222);
 
@@ -197,85 +197,79 @@ export async function installEgoLinux(): Promise<void> {
         await ensureBridge();
       } catch {}
       try {
-        const { request } = await import("node:http");
-        const port = instance?.port ?? daemonPort() ?? WS_PORT;
-        const tabs: Array<{ targetId: string; title?: string; url?: string }> =
-          await new Promise((resolve, reject) => {
+        // Target.getTargets (browser endpoint) carries browserContextId,
+        // which the HTTP /json list does not expose reliably. Filtering by
+        // the active space's context is what isolates spaces from each
+        // other and from the user's own tabs.
+        const { cdp } = await import("../cdp-eval.js");
+        const result = (await cdp("Target.getTargets", {})) as {
+          targetInfos?: Array<{
+            targetId: string;
+            type?: string;
+            title?: string;
+            url?: string;
+            browserContextId?: string;
+          }>;
+        };
+        const contextId = await activeBrowserContextId();
+        // Chrome's HTTP /json is ordered by recency of activation; use it to
+        // mark the frontmost page so currentTab() (tab.active || tabs[0])
+        // resolves the most recently activated tab, not CDP's stable order.
+        let activationOrder: string[] = [];
+        try {
+          const { request } = await import("node:http");
+          const port = instance?.port ?? daemonPort() ?? WS_PORT;
+          activationOrder = await new Promise<string[]>((resolve) => {
             const req = request(`http://127.0.0.1:${port}/json`, (res) => {
               let d = "";
               res.on("data", (c: Buffer) => (d += c.toString()));
               res.on("end", () => {
                 try {
-                  const arr = JSON.parse(d) as Array<{
-                    id?: string;
-                    targetId?: string;
-                    title?: string;
-                    url?: string;
-                    type?: string;
-                  }>;
-                  resolve(
-                    arr
-                      .filter((t) => t.type === "page" || !t.type)
-                      .map((t) => ({
-                        targetId: t.id ?? t.targetId ?? "",
-                        title: t.title ?? "",
-                        url: t.url ?? "",
-                      })),
-                  );
-                } catch (e) {
-                  reject(e);
+                  const arr = JSON.parse(d) as Array<{ id?: string }>;
+                  resolve(arr.map((t) => t.id ?? ""));
+                } catch {
+                  resolve([]);
                 }
               });
             });
-            req.on("error", (err) => {
-              // Distinguish "no daemon" (ECONNREFUSED) from empty response;
-              // caller sees {tabs:[]} but stderr log aids doctor-linux triage.
-              if ((err as NodeJS.ErrnoException)?.code === "ECONNREFUSED") {
-                console.error(
-                  `[ego-linux] listTabs: no daemon on :${port} (${(err as Error).message})`,
-                );
-              }
-              resolve([]);
-            });
+            req.on("error", () => resolve([]));
             req.end();
           });
-        if (tabs.length) return { tabs };
+        } catch {}
+        const rank = new Map(activationOrder.map((id, i) => [id, i]));
+        const tabs = (result.targetInfos ?? [])
+          .filter((t) => t.type === "page")
+          .filter(
+            (t) => contextId === undefined || t.browserContextId === contextId,
+          )
+          .sort(
+            (a, b) =>
+              (rank.get(a.targetId) ?? Infinity) -
+              (rank.get(b.targetId) ?? Infinity),
+          )
+          .map((t, index) => ({
+            targetId: t.targetId,
+            title: t.title ?? "",
+            url: t.url ?? "",
+            active: index === 0,
+          }));
+        return { tabs };
       } catch {}
       return { tabs: [] };
     },
     async createTab(url: string) {
-      const { request } = await import("node:http");
-      const port = instance?.port ?? daemonPort() ?? WS_PORT;
-      const qs = url ? `?${new URLSearchParams({ url }).toString()}` : "";
-      const tid: string = await new Promise<string>((resolve, reject) => {
-        const req = request(
-          {
-            hostname: "127.0.0.1",
-            port,
-            path: `/json/new${qs}`,
-            method: "PUT",
-          },
-          (res) => {
-            let d = "";
-            res.on("data", (c: Buffer) => (d += c.toString()));
-            res.on("end", () => {
-              try {
-                const j = JSON.parse(d) as { id?: string; targetId?: string };
-                resolve(j.id ?? j.targetId ?? "");
-              } catch (e) {
-                reject(e);
-              }
-            });
-          },
-        );
-        req.on("error", reject);
-        req.end();
-      }).catch(() => "");
-      if (tid) return { targetId: tid };
-      const b = await ensureBridge();
-      void b;
-      void url;
-      return { targetId: "" };
+      try {
+        await ensureBridge();
+        const { cdp } = await import("../cdp-eval.js");
+        const contextId = await activeBrowserContextId();
+        const created = (await cdp("Target.createTarget", {
+          url: url || "about:blank",
+          ...(contextId ? { browserContextId: contextId } : {}),
+        })) as { targetId?: string };
+        return { targetId: created.targetId ?? "" };
+      } catch {
+        return { targetId: "" };
+      }
     },
     async snapshot(opts: unknown) {
       return snapshot.snapshot(opts as never);
@@ -283,8 +277,8 @@ export async function installEgoLinux(): Promise<void> {
     async listTaskSpaces() {
       return taskSpaces.listTaskSpaces();
     },
-    async createTaskSpace(name: string) {
-      return taskSpaces.createTaskSpace(name);
+    async createTaskSpace(name: string, profileId?: string) {
+      return taskSpaces.createTaskSpace(name, profileId);
     },
     async useTaskSpace(id: number) {
       return taskSpaces.useTaskSpace(id);
@@ -306,6 +300,13 @@ export async function installEgoLinux(): Promise<void> {
     },
     getBrowserVersion() {
       return null;
+    },
+    async listProfiles() {
+      // Linux drives one Chromium profile (the daemonised chrome-profile);
+      // per-space isolation comes from BrowserContexts, not profiles.
+      return {
+        profiles: [{ id: "default", name: "Default", isDefault: true }],
+      };
     },
   };
 
