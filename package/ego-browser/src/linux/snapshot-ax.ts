@@ -54,7 +54,10 @@ export class LinuxSnapshot {
           }
         }
         let content = lines.join("\n");
-        if (opts.maxResultLength != null && content.length > opts.maxResultLength) {
+        if (
+          opts.maxResultLength != null &&
+          content.length > opts.maxResultLength
+        ) {
           content = content.slice(0, opts.maxResultLength);
         }
         return { content, refs };

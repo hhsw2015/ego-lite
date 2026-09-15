@@ -91,7 +91,10 @@ export class LinuxTaskSpaces {
     activeId = spaces.size ? [...spaces.keys()][0] : null;
   }
 
-  async claimTaskSpace(id: number, _name?: string): Promise<TaskSpace | EgoError> {
+  async claimTaskSpace(
+    id: number,
+    _name?: string,
+  ): Promise<TaskSpace | EgoError> {
     const s = spaces.get(id);
     if (!s)
       return {

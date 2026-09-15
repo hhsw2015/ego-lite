@@ -95,6 +95,12 @@ async function connectWithTimeout(
 
     ws.on("open", () => {
       clearTimeout(timer);
+      // Unref the TCP socket: the bridge must not keep the CLI process alive
+      // after the user script finishes (the daemon outlives us by design).
+      // While the script is running, pending work holds the loop open anyway.
+      (
+        ws as unknown as { _socket?: { unref?: () => void } }
+      )._socket?.unref?.();
       resolve(ws);
     });
 

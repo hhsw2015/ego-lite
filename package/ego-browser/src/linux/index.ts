@@ -16,7 +16,9 @@
  * deferred to the first `globalThis.ego` access when not already present.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import { connectLinuxBridge } from "./bridge.js";
 import { launchChrome, type ChromeInstance } from "./launcher.js";
@@ -24,6 +26,26 @@ import { LinuxSnapshot } from "./snapshot-ax.js";
 import { LinuxTaskSpaces } from "./task-spaces.js";
 
 const WS_PORT = Number(process.env.EGO_LINUX_PORT ?? 9222);
+
+// A daemon launched with --remote-debugging-port=0 records its ephemeral port
+// in <profile>/DevToolsActivePort. Reading it lets a fresh CLI process reuse
+// the running daemon instead of probing only :9222, failing, and then
+// stalling on the daemon's SingletonLock while trying to relaunch.
+function daemonPort(): number | null {
+  try {
+    const portFile = join(
+      homedir(),
+      ".cache",
+      "ego-lite",
+      "chrome-profile",
+      "DevToolsActivePort",
+    );
+    const port = Number(readFileSync(portFile, "utf-8").split("\n")[0]);
+    return Number.isFinite(port) && port > 0 ? port : null;
+  } catch {
+    return null;
+  }
+}
 
 let instance: ChromeInstance | null = null;
 let bridge: { send: (m: string) => void; close: () => void } | null = null;
@@ -73,13 +95,18 @@ function onBridgeClose(): void {
   bridgePromise = null;
   if (shutdownCleanup) {
     process.removeListener("exit", shutdownCleanup);
-    process.removeListener("SIGINT", shutdownCleanup as unknown as NodeJS.SignalsListener);
-    process.removeListener("SIGTERM", shutdownCleanup as unknown as NodeJS.SignalsListener);
+    process.removeListener(
+      "SIGINT",
+      shutdownCleanup as unknown as NodeJS.SignalsListener,
+    );
+    process.removeListener(
+      "SIGTERM",
+      shutdownCleanup as unknown as NodeJS.SignalsListener,
+    );
     shutdownCleanup = null;
   }
-  try {
-    instance?.process.kill("SIGTERM");
-  } catch {}
+  // Drop the handle without killing the daemon: a WS close is usually this
+  // CLI process exiting, and the daemon must survive for the next invocation.
   instance = null;
 }
 
@@ -87,16 +114,23 @@ async function ensureBridge(): Promise<{ send: (m: string) => void }> {
   if (bridge) return bridge;
   if (bridgePromise) return bridgePromise;
   bridgePromise = (async (): Promise<{ send: (m: string) => void }> => {
-    try {
-      bridge = await connectLinuxBridge({
-        port: WS_PORT,
-        timeoutMs: 1500,
-        onMessage: onBridgeMessage,
-        onClose: onBridgeClose,
-      });
-      return bridge;
-    } catch {}
-    instance = await launchChrome({ headless: true });
+    for (const port of [daemonPort(), WS_PORT]) {
+      if (port === null) continue;
+      try {
+        bridge = await connectLinuxBridge({
+          port,
+          timeoutMs: 1500,
+          onMessage: onBridgeMessage,
+          onClose: onBridgeClose,
+        });
+        return bridge;
+      } catch {}
+    }
+    // EGO_HEADFUL=1 opens a visible Chromium window so the user can watch and
+    // take over agent work (closest Linux analog to ego lite's Space UI).
+    instance = await launchChrome({
+      headless: process.env.EGO_HEADFUL !== "1",
+    });
     await new Promise((r) => setTimeout(r, 600));
     bridge = await connectLinuxBridge({
       port: instance.port,
@@ -105,11 +139,11 @@ async function ensureBridge(): Promise<{ send: (m: string) => void }> {
       onClose: onBridgeClose,
     });
     const cleanup = () => {
+      // Close only this process's WS bridge. The Chromium daemon stays up so
+      // subsequent CLI invocations (and a headful window the user is
+      // watching) survive; DevToolsActivePort lets them reconnect.
       try {
         bridge?.close();
-      } catch {}
-      try {
-        instance?.process.kill("SIGTERM");
       } catch {}
     };
     shutdownCleanup = cleanup;
@@ -164,7 +198,7 @@ export async function installEgoLinux(): Promise<void> {
       } catch {}
       try {
         const { request } = await import("node:http");
-        const port = instance?.port ?? WS_PORT;
+        const port = instance?.port ?? daemonPort() ?? WS_PORT;
         const tabs: Array<{ targetId: string; title?: string; url?: string }> =
           await new Promise((resolve, reject) => {
             const req = request(`http://127.0.0.1:${port}/json`, (res) => {
@@ -197,7 +231,9 @@ export async function installEgoLinux(): Promise<void> {
               // Distinguish "no daemon" (ECONNREFUSED) from empty response;
               // caller sees {tabs:[]} but stderr log aids doctor-linux triage.
               if ((err as NodeJS.ErrnoException)?.code === "ECONNREFUSED") {
-                console.error(`[ego-linux] listTabs: no daemon on :${port} (${(err as Error).message})`);
+                console.error(
+                  `[ego-linux] listTabs: no daemon on :${port} (${(err as Error).message})`,
+                );
               }
               resolve([]);
             });
@@ -209,7 +245,7 @@ export async function installEgoLinux(): Promise<void> {
     },
     async createTab(url: string) {
       const { request } = await import("node:http");
-      const port = instance?.port ?? WS_PORT;
+      const port = instance?.port ?? daemonPort() ?? WS_PORT;
       const qs = url ? `?${new URLSearchParams({ url }).toString()}` : "";
       const tid: string = await new Promise<string>((resolve, reject) => {
         const req = request(

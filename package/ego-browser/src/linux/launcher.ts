@@ -7,6 +7,7 @@
  * linux/ modules into globalThis.ego.
  */
 import { type ChildProcess, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, readlink, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -43,7 +44,24 @@ export interface ChromeInstance {
 // ---------------------------------------------------------------------------
 
 const CACHE_DIR = join(homedir(), ".cache", "ego-lite");
-const DEFAULT_EXECUTABLE = "/usr/bin/google-chrome";
+// Same candidate order as hasChrome() in index.ts — EGO_CHROME_BIN wins,
+// then google-chrome variants, then chromium. hasChrome() accepting a binary
+// that launchChrome() cannot resolve would activate then fail to spawn.
+const CHROME_CANDIDATES = [
+  "/usr/bin/google-chrome",
+  "/usr/bin/google-chrome-stable",
+  "/usr/bin/chromium-browser",
+  "/usr/bin/chromium",
+  "/snap/bin/chromium",
+];
+function defaultExecutable(): string {
+  const envBin = process.env.EGO_CHROME_BIN;
+  if (envBin && existsSync(envBin)) return envBin;
+  for (const candidate of CHROME_CANDIDATES) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return CHROME_CANDIDATES[0];
+}
 const SPAWN_TIMEOUT_MS = 15_000;
 const PORT_REGEX = /DevTools listening on ws:\/\/[^:]+:(\d+)/;
 
@@ -113,7 +131,7 @@ export async function launchChrome(
 ): Promise<ChromeInstance> {
   await mkdir(CACHE_DIR, { recursive: true });
 
-  const executable = options.executablePath ?? DEFAULT_EXECUTABLE;
+  const executable = options.executablePath ?? defaultExecutable();
   const profileDir = join(CACHE_DIR, "chrome-profile");
   await clearStaleSingletonLock(profileDir);
 
@@ -142,9 +160,11 @@ export async function launchChrome(
   }
 
   return new Promise<ChromeInstance>((resolve, reject) => {
+    // Detached: the daemon must outlive the short-lived CLI process so later
+    // invocations (and the user watching a headful window) can reuse it.
     const child = spawn(executable, args, {
       stdio: ["ignore", "ignore", "pipe"],
-      detached: false,
+      detached: true,
       env: { ...process.env },
     });
 
@@ -167,6 +187,11 @@ export async function launchChrome(
       if (found !== null) {
         resolved = true;
         clearTimeout(timer);
+        // Stop reading stderr and drop the child from this process's ref
+        // count: the daemon keeps running after the CLI exits, and later
+        // invocations find it via DevToolsActivePort.
+        child.stderr?.destroy();
+        child.unref();
         resolve({
           pid: child.pid!,
           port: found,
